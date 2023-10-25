@@ -89,7 +89,7 @@ def chisq(p,image,psf,limiter,basenoise): ### THIS IS THE VERSION OF CHISQ THAT 
     
     '''
     chisq is purely supposed to be an under-the-hood function. For a given parameter set (packed in 'p'), an image, a psf,
-    a chilimit mask, and a 1sigma background noise in the image, returns the chi-squared value computed by comparing the model
+    a fitbound mask, and a 1sigma background noise in the image, returns the chi-squared value computed by comparing the model
     to the image being fit to. Computes the variance map under the assumption of poisson noise, with mean values (and therefore
     variance contribution) being the model value. Total variance is the base 1sigma noise squared, plus the model variance contribution
     '''
@@ -106,7 +106,7 @@ def chisq(p,image,psf,limiter,basenoise): ### THIS IS THE VERSION OF CHISQ THAT 
     
     var = f0*tsf+basenoise**2 ## poisson!
     
-    resid = limiter*(model-image)**2/var # this is the chisquared contribution from each cell (limiter is an array of ones and zeros specified by chilimit in emcee_fit()
+    resid = limiter*(model-image)**2/var # this is the chisquared contribution from each cell (limiter is an array of ones and zeros specified by fitbound in emcee_fit()
                                         # that prevents features far beyond the streak body from being considered in chi-squared calculations
     C = np.sum(resid) # chi - squared calculated by summing the contributions from each cell (above)
     
@@ -134,7 +134,7 @@ def chisq_b(p,b,image,psf,limiter,basenoise): ## ALL AS IN CHISQ ABOVE BUT WITH 
     
     return C
 
-def lnprob(p,bounds,image,psf,limiter,basenoise):  ## lnprob is the logarithm of the likelihood function (which is, up to a constant, exp(-chisquared/2)) 
+def lnprob(p,bounds,image,psf,limiter,basenoise,skysubbed,approx = False):  ## lnprob is the logarithm of the likelihood function (which is, up to a constant, exp(-chisquared/2)) 
     
     '''
     the log likelihood function for MCMC. Usually passes -chisquared/2, passes -infinity if a parameter is outside of bounds
@@ -149,22 +149,77 @@ def lnprob(p,bounds,image,psf,limiter,basenoise):  ## lnprob is the logarithm of
             
             return -np.inf ### if a parameter violates a boundary, make sure it isn't accepted as a state (effectively restricts parameter space available)
     
-    return -0.5*np.nan_to_num(chisq(p,image,psf,limiter,basenoise),nan = 1e20) #return the logarithm of the liklihood, but replace any nans with massive numbers
-                                                                                # so that the states which return weird values or ValueErrors can never be accepted
-
-def lnprob_b(p,bounds,b,image,psf,limiter,basenoise): ## AS WITH lnprob ABOVE BUT FOR FIXED BACKGROUND
+    x0,y0,f0,L0,angle,b = p # Unpack the state vector p
+        
+    L0 = int(L0) # fix the given length to be an integer
     
-    '''
-    exactly as in lnprob, but with a fixed background ('b')
-    '''
+    tsf = gen_TSF(image,x0,y0,psf,L0,angle)
+    
+    #comparim = image[anchor[0]:anchor[0]+Lx,anchor[1]:anchor[1]+Ly]
+    
+    model = f0*tsf + b
+    
+    expected = model
+    observed = image
+    
+    if skysubbed == True:
+    
+        expected += basenoise**2
+        observed += basenoise**2
+        
+    observed = observed.astype(int)
+    
+    if approx == False: ### compute the factorial
+        
+        resid = limiter*np.nan_to_num((observed*np.log(expected)-expected-np.log(sci.special.factorial(observed))),nan = -1e20)
+        
+        return np.sum(resid)
+    
+    elif approx == True: ### use Stirling's approximation
+        
+        resid = -limiter*np.nan_to_num((expected-observed)+observed*np.log(observed/expected),nan = 1e20)
+        
+        return np.sum(resid)
+
+def lnprob_b(p,bounds,b,image,psf,limiter,basenoise,skysubbed,approx = False): ## AS WITH lnprob ABOVE BUT FOR FIXED BACKGROUND
     
     for i in range(len(p)):
         
         if (p[i] < bounds[i][0]) or (p[i] > bounds[i][1]):
             
-            return -np.inf
+            return -np.inf ### if a parameter violates a boundary, make sure it isn't accepted as a state (effectively restricts parameter space available)
     
-    return -0.5*np.nan_to_num(chisq_b(p,b,image,psf,limiter,basenoise),nan = 1e20)
+    x0,y0,f0,L0,angle = p # Unpack the state vector p
+        
+    L0 = int(L0) # fix the given length to be an integer
+    
+    tsf = gen_TSF(image,x0,y0,psf,L0,angle)
+    
+    #comparim = image[anchor[0]:anchor[0]+Lx,anchor[1]:anchor[1]+Ly]
+    
+    model = f0*tsf + b
+    
+    expected = model
+    observed = image
+    
+    if skysubbed == True:
+    
+        expected += basenoise**2
+        observed += basenoise**2
+        
+    observed = observed.astype(int)
+    
+    if approx == False: ### compute the factorial
+        
+        resid = limiter*np.nan_to_num((observed*np.log(expected)-expected-np.log(sci.special.factorial(observed))),nan = -1e20)
+        
+        return np.sum(resid)
+    
+    elif approx == True: ### use Stirling's approximation
+        
+        resid = -limiter*np.nan_to_num((expected-observed)+observed*np.log(observed/expected),nan = 1e20)
+        
+        return np.sum(resid)
 
 def chisq2(x0,y0,f0,L0,angle,b,image,psf,basenoise): ## chisq but without packaged parameter vector
     
@@ -422,8 +477,16 @@ class streak_interface: ### THE PRIMARY CLASS OF THIS TOOLSET. PROVIDES A FRAMEW
         
         d = streak.dist
         R = self.R
-        r_star = np.sqrt((R/d)**2+2*(R/d)*np.sin(streak.alpha)+1)
-        nadir = np.pi/2 - streak.alpha - np.arcsin(np.cos(streak.alpha)/r_star)
+        
+        if streak.theta_override == None:
+            
+            r_star = np.sqrt((R/d)**2+2*(R/d)*np.sin(streak.alpha)+1)
+            nadir = np.pi/2 - streak.alpha - np.arcsin(np.cos(streak.alpha)/r_star)
+            
+        else: 
+            
+            nadir = streak.theta_override
+            
         if visout == True:
             
             print('NADIR angle: %.2f degrees' %np.rad2deg(nadir))
@@ -444,7 +507,7 @@ class streak_interface: ### THE PRIMARY CLASS OF THIS TOOLSET. PROVIDES A FRAMEW
         if visout == True:
             
             print('CPUL: %.3f' %cpul)
-            print('CALCULATED MAGZERO WITH PERFECT FITTING: %.5f' %(2.5*np.log10(counts) + m))
+            #print('CALCULATED MAGZERO WITH PERFECT FITTING: %.5f' %(2.5*np.log10(counts) + m))
         
         streak.cpul = cpul
         
@@ -817,7 +880,7 @@ class streak_interface: ### THE PRIMARY CLASS OF THIS TOOLSET. PROVIDES A FRAMEW
                 print('Calculated Zeropoint with comparison subtracted: %.4f' %(streak.totalmag+2.5*np.log10(flux-compar_flux)))
             print('True Zeropoint: %.4f' %(self.magzero))
             
-    def emcee_fit(self,streak,section,psf,bestguess,bounds,basenoise = 6.4,nwalk = 20,nburn = 200,niter = 500,walkerreport = False,chilimit =                        None,visout = True,fixed_b = None,SM = 2.5):
+    def emcee_fit(self,streak,section,psf,bestguess,bounds,basenoise = 6.4,nwalk = 20,nburn = 200,niter = 500,walkerreport = False,fitbound = None,visout = True,fixed_b = None,SM = 2.5,skysubbed = True,approx = False):
         '''
         emcee_fit uses MCMC algorithms from the package 'emcee' to fit a streak model to data. This is a much better approach than the raw chi-           squared minimization, as the 6 dimensional parameter space and noisy images mean that there are potentially a great number of local chi-         squared minima. MCMC fitting is well suited to high-dimensional optimization and also lends itself to good estimates of parameter                 certainty. The many arguements are as follows:
         
@@ -928,16 +991,16 @@ class streak_interface: ### THE PRIMARY CLASS OF THIS TOOLSET. PROVIDES A FRAMEW
         
         xx,yy = np.meshgrid(x_s,y_s) ## Create the meshgrid for the points to run markercheck and checkedge on
         
-        if chilimit != None:  ## If chilimit is specified, then the array 'limiter', which will multiply the returned chi^2 values, is set equal to 1 inside this region
+        if fitbound != None:  ## If fitbound is specified, then the array 'limiter', which will multiply the returned chi^2 values, is set equal to 1 inside this region
                                 ## and equal to zero outside
         
-            limiter = markercheck(xx,yy,bestguess[0]+len(section)/2,bestguess[1]+len(section[0])/2,chilimit,bestguess[3],bestguess[4])
+            limiter = markercheck(xx,yy,bestguess[0]+len(section)/2,bestguess[1]+len(section[0])/2,fitbound,bestguess[3],bestguess[4])
             
             edgex,edgey = checkedge(limiter)
             
         else: 
             
-            limiter = section*0+1 ## Return all ones for no chilimit, so that chi-squared contributions from all across the image are considered
+            limiter = section*0+1 ## Return all ones for no fitbound, so that chi-squared contributions from all across the image are considered
     
         dim = len(bestguess) ## dimension of the parameter space
         
@@ -949,7 +1012,7 @@ class streak_interface: ### THE PRIMARY CLASS OF THIS TOOLSET. PROVIDES A FRAMEW
         
             fig,axs = plt.subplots(1,2,figsize = (14,7))
             axs[0].imshow(section,vmax = self.VM,vmin = -self.VM, cmap = 'Greys')
-            if chilimit != None:
+            if fitbound != None:
                 axs[0].scatter(edgex,edgey,c = 'r',s = 50/len(section[0]),alpha = 0.8,zorder = 5)
             axs[0].set_title('Section given')
             axs[0].grid()
@@ -970,11 +1033,11 @@ class streak_interface: ### THE PRIMARY CLASS OF THIS TOOLSET. PROVIDES A FRAMEW
             
             if fixed_b == None:
 
-                sampler = emcee.EnsembleSampler(nwalk,dim,lnprob,args = [boundary,section,psf,limiter,basenoise],pool = pool)
+                sampler = emcee.EnsembleSampler(nwalk,dim,lnprob,args = [boundary,section,psf,limiter,basenoise,skysubbed,approx],pool = pool)
 
             else:
 
-                sampler = emcee.EnsembleSampler(nwalk,dim,lnprob_b,args = [boundary,fixed_b,section,psf,limiter,basenoise],pool = pool)
+                sampler = emcee.EnsembleSampler(nwalk,dim,lnprob_b,args = [boundary,fixed_b,section,psf,limiter,basenoise,skysubbed,approx],pool = pool)
 
             r0 = []
 
@@ -997,7 +1060,7 @@ class streak_interface: ### THE PRIMARY CLASS OF THIS TOOLSET. PROVIDES A FRAMEW
                                   %(i,r0[i][0],r0[i][1],r0[i][2],r0[i][3],np.rad2deg(r0[i][4]),fixed_b))
 
 
-            print("Executing burn-in... this may take a while.")
+            print("Performing burn-in...")
             
             pos_burn, prob_burn, state_burn = sampler.run_mcmc(r0, nburn, progress = True)
             time.sleep(0.1)
@@ -1005,10 +1068,10 @@ class streak_interface: ### THE PRIMARY CLASS OF THIS TOOLSET. PROVIDES A FRAMEW
             start_time = time.time()
             samps_burn = sampler.chain
             sampler.reset()
-            print("Executing production run... this will also take a while.")
+            print("Performing main run...")
             pos, prob, state = sampler.run_mcmc(pos_burn, niter, rstate0=state_burn, progress = True)
             time.sleep(0.1)
-            print("Production Complete. Elapsed time: %.1fs                                                           " %(time.time()-start_time)) #SPACES ARE INTENTIONAL!
+            print("Finished. Elapsed time: %.1fs                                                           " %(time.time()-start_time)) #SPACES ARE INTENTIONAL!
 
         samps = sampler.chain
         probs = sampler.lnprobability
@@ -1132,7 +1195,7 @@ class streak_interface: ### THE PRIMARY CLASS OF THIS TOOLSET. PROVIDES A FRAMEW
 class sim_streak:  ## sim_streak is the class corresponding to a simulated streak in the image. Instances are intialzed in reference to a                                streak_interface
                     ## instance, which is the '.sim' parameter of the sim_streak instance
         
-        def __init__(self, sim, x1 = 100, y1 = 100, L = 500, theta = np.pi/4,S = 0.92335, dist = 6e5, alpha = np.pi/4, IS_rad = 16.97,A_IS =                          1.27e-4, delta_t = 0.15):
+        def __init__(self, sim, x1 = 100, y1 = 100, L = 500, theta = np.pi/4,S = 0.92335, dist = 6e5, alpha = np.pi/4, IS_rad = 16.97,A_IS =                          1.27e-4, delta_t = 0.15,theta_override = None):
         
             self.in_image = False
             self.hasbeenadded = False ## this keep track of whether or not the streak has ever been added
@@ -1146,6 +1209,7 @@ class sim_streak:  ## sim_streak is the class corresponding to a simulated strea
             self.IS_rad = IS_rad
             self.A_IS = A_IS
             self.delta_t = delta_t
+            self.theta_override = theta_override
             
             self.sim = sim
             
@@ -1183,12 +1247,13 @@ class sim_streak:  ## sim_streak is the class corresponding to a simulated strea
                     self.last_IS_rad = self.IS_rad
                     self.last_A_IS = self.A_IS
                     self.last_delta_t = self.delta_t
+                    self.last_theta_override = self.theta_override
 
                     self.sim.add_streak(self)
                     self.in_image = True                                   # (below) checks to see if all parameters are the same as when last added, because then
                                                                             # can just add the old map rather than recomputing
 
-                elif (self.last_x1 == self.x1) and (self.last_y1 == self.y1) and (self.last_L == self.L) and (self.last_theta == self.theta) and (self.last_S_of_lambda == self.S_of_lambda) and (self.last_dist == self.dist) and (self.last_alpha == self.alpha) and (self.last_IS_rad == self.IS_rad) and (self.last_A_IS == self.A_IS) and (self.last_delta_t == self.delta_t): ## if no parameters have been changed:
+                elif (self.last_x1 == self.x1) and (self.last_y1 == self.y1) and (self.last_L == self.L) and (self.last_theta == self.theta) and (self.last_S_of_lambda == self.S_of_lambda) and (self.last_dist == self.dist) and (self.last_alpha == self.alpha) and (self.last_IS_rad == self.IS_rad) and (self.last_A_IS == self.A_IS) and (self.last_delta_t == self.delta_t) and (self.last_theta_override == self.theta_override): ## if no parameters have been changed:
 
                     self.sim.current_image += self.map
                     print('Streak total magnitude: %.3f' %self.totalmag)
@@ -1210,6 +1275,7 @@ class sim_streak:  ## sim_streak is the class corresponding to a simulated strea
                     self.last_IS_rad = self.IS_rad
                     self.last_A_IS = self.A_IS
                     self.last_delta_t = self.delta_t
+                    self.last_theta_override = self.theta_override
 
                     self.sim.add_streak(self)
                     self.in_image = True
@@ -1285,7 +1351,7 @@ class sim_streak:  ## sim_streak is the class corresponding to a simulated strea
 class real_streak:  ## sim_streak is the class corresponding to a simulated streak in the image. Instances are intialzed in reference to a                              streak_interface
                     ## instance, which is the '.sim' parameter of the sim_streak instance
         
-        def __init__(self, sim, x1 = 100, y1 = 100, L = 500, theta = np.pi/4,S = 0.92335, dist = 6e5, alpha = np.pi/4, IS_rad = 16.97,A_IS =                          1.27e-4, delta_t = 0.15):
+        def __init__(self, sim, x1 = 100, y1 = 100, L = 500, theta = np.pi/4,S = 0.92335, dist = 6e5, alpha = np.pi/4, IS_rad = 16.97,A_IS =                          1.27e-4, delta_t = 0.15,theta_override = None):
         
             self.in_image = True
             self.x1 = x1
@@ -1298,6 +1364,7 @@ class real_streak:  ## sim_streak is the class corresponding to a simulated stre
             self.IS_rad = IS_rad
             self.A_IS = A_IS
             self.delta_t = delta_t
+            self.theta_override = theta_override
             
             self.sim = sim
             
@@ -1305,8 +1372,15 @@ class real_streak:  ## sim_streak is the class corresponding to a simulated stre
             
             d = self.dist
             R = self.sim.R
-            r_star = np.sqrt((R/d)**2+2*(R/d)*np.sin(self.alpha)+1)
-            nadir = np.pi/2 - self.alpha - np.arcsin(np.cos(self.alpha)/r_star)
+            
+            if self.theta_override == None:
+                
+                r_star = np.sqrt((R/d)**2+2*(R/d)*np.sin(self.alpha)+1)
+                nadir = np.pi/2 - self.alpha - np.arcsin(np.cos(self.alpha)/r_star)
+            
+            else: 
+                
+                nadir = self.theta_override
             
             if visout == True:
             
@@ -1662,9 +1736,9 @@ def adapted_model(im_size, x1, x2, y1, y2, psf_sigma=2, replace_value=0, thresho
         im0[d <= dmax] = 1
         
     # must clip this streak:
-    if x1 == x2 and y1 == y2:  # this is extremely unlikely to happen...
+    if x1 == x2 and y1 == y2:
         im0 = np.zeros(im0.shape)
-    elif x1 == x2:  # vertical line (a is infinite)
+    elif x1 == x2:
         if y1 > y2:
             im0[y > y1] = 0
             im0[y < y2] = 0
@@ -1672,7 +1746,7 @@ def adapted_model(im_size, x1, x2, y1, y2, psf_sigma=2, replace_value=0, thresho
             im0[y < y1] = 0
             im0[y > y2] = 0
 
-    elif y1 == y2:  # horizontal line
+    elif y1 == y2: 
         if x1 > x2:
             im0[x > x1] = 0
             im0[x < x2] = 0
